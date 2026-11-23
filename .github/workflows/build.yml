@@ -26,14 +26,12 @@ jobs:
               find "$GITHUB_WORKSPACE" -maxdepth 1 -type f \
                 -iname 'sitandwatch-mod-source*.zip' -print | sort -V
             )
-
             if [ "${#archives[@]}" -eq 0 ]; then
               mapfile -t archives < <(
                 find "$GITHUB_WORKSPACE" -maxdepth 1 -type f \
                   -iname '*.zip' -print | sort -V
               )
             fi
-
             if [ "${#archives[@]}" -gt 0 ]; then
               archive="${archives[${#archives[@]}-1]}"
             else
@@ -43,20 +41,16 @@ jobs:
 
           if [ -n "${archive:-}" ]; then
             echo "Using source archive: $archive"
-
             extract_dir="$RUNNER_TEMP/sitandwatch-source"
             rm -rf "$extract_dir"
             mkdir -p "$extract_dir"
-
             unzip -q -o "$archive" -d "$extract_dir"
 
             build_file="$(find "$extract_dir" -type f -name build.gradle -print -quit)"
-
             if [ -z "$build_file" ]; then
-              echo "ERROR: build.gradle not found."
+              echo "ERROR: build.gradle not found." >&2
               exit 1
             fi
-
             project_root="$(dirname "$build_file")"
 
           elif [ -f "$GITHUB_WORKSPACE/build.gradle" ]; then
@@ -78,7 +72,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           test -f src/main/java/com/luxurylighting/client/DynamicLightManager.java
           test -f src/main/resources/com/luxurylighting/mixin/LevelRendererMixin.class
           test -f src/main/resources/luxurylighting.mixins.json
@@ -89,13 +82,74 @@ jobs:
           test -f src/main/resources/data/minecraft/worldgen/world_preset/normal.json
           test -f src/main/resources/data/sitandwatch/worldgen/world_preset/plains_only.json
 
+      - name: Patch Java compile errors
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import os
+
+          root = Path(os.environ["PROJECT_DIR"])
+          data_file = root / "src/main/java/com/sitandwatch/world/StoryData.java"
+          manager_file = root / "src/main/java/com/sitandwatch/world/StoryManager.java"
+
+          if not data_file.is_file() or not manager_file.is_file():
+              raise SystemExit("ERROR: StoryData.java or StoryManager.java is missing.")
+
+          data = data_file.read_text(encoding="utf-8")
+
+          if "day3FlirtStarted" not in data.split("public StoryData()", 1)[0]:
+              anchor = "public int day3Phase;"
+              if anchor not in data:
+                  raise SystemExit("ERROR: Could not find day3Phase.")
+              data = data.replace(
+                  anchor,
+                  anchor + "\n    public boolean day3FlirtStarted, day3AskedSmugAboutRon;",
+                  1,
+              )
+              data_file.write_text(data, encoding="utf-8")
+              print("Added missing Day 3 story fields.")
+
+          manager = manager_file.read_text(encoding="utf-8")
+
+          bad = "fan.distanceToSqr(d.home)"
+          good = "fan.distanceToSqr(Vec3.atBottomCenterOf(d.home))"
+
+          replacements = manager.count(bad)
+
+          if replacements:
+              manager = manager.replace(bad, good)
+
+              if "import net.minecraft.world.phys.Vec3;" not in manager:
+                  import_anchor = "import net.minecraft.world.phys.AABB;"
+                  if import_anchor not in manager:
+                      raise SystemExit("ERROR: Could not find Vec3 import location.")
+                  manager = manager.replace(
+                      import_anchor,
+                      import_anchor + "\nimport net.minecraft.world.phys.Vec3;",
+                      1,
+                  )
+
+              manager_file.write_text(manager, encoding="utf-8")
+
+          print(f"Fixed {replacements} distance checks.")
+
+          if bad in manager:
+              raise SystemExit("ERROR: An incompatible distance check remains.")
+
+          if "day3FlirtStarted" not in data_file.read_text(encoding="utf-8"):
+              raise SystemExit("ERROR: Day 3 fields were not written correctly.")
+          PYCODE
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Gradle
+      - name: Set up Gradle 8.1.1
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.1.1'
@@ -108,23 +162,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p "$PROJECT_DIR/build/release"
 
           mapfile -t jars < <(
-            find "$PROJECT_DIR/build/libs" -maxdepth 1 -type f \
-              -name '*.jar' \
-              ! -iname '*sources*.jar' \
-              ! -iname '*-dev.jar' | sort
+            find "$PROJECT_DIR/build/libs" -maxdepth 1 -type f -name '*.jar' \
+              ! -iname '*sources*.jar' ! -iname '*-dev.jar' | sort
           )
 
           if [ "${#jars[@]}" -eq 0 ]; then
-            echo "ERROR: No mod JAR produced."
+            echo "ERROR: No mod JAR produced." >&2
             exit 1
           fi
 
-          cp "${jars[0]}" \
-            "$PROJECT_DIR/build/release/Sit-and-watch.jar"
+          cp "${jars[0]}" "$PROJECT_DIR/build/release/Sit-and-watch.jar"
 
           jar tf "$PROJECT_DIR/build/release/Sit-and-watch.jar" \
             | grep -Fx 'com/luxurylighting/client/DynamicLightManager.class'
